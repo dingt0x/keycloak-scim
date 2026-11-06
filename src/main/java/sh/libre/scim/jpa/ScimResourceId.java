@@ -70,11 +70,11 @@ public class ScimResourceId implements Serializable {
             return false;
         }
         var o = (ScimResourceId) other;
-        return o.id == id
-                && o.realmId == realmId
-                && o.componentId == componentId
-                && o.type == type
-                && o.externalId == externalId;
+        return Objects.equals(o.id, id)
+                && Objects.equals(o.realmId, realmId)
+                && Objects.equals(o.componentId, componentId)
+                && Objects.equals(o.type, type)
+                && Objects.equals(o.externalId, externalId);
     }
 
     @Override

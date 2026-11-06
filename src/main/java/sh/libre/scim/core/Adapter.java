@@ -103,7 +103,7 @@ public abstract class Adapter<M extends RoleMapperModel, S extends ResourceNode>
         } catch (NotFoundException e) {
         } catch (NoResultException e) {
         } catch (Exception e) {
-            LOGGER.error(e);
+            LOGGER.error(e.getMessage(), e);
         }
 
         return null;

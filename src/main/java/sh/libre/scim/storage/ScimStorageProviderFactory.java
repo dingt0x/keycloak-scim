@@ -2,14 +2,18 @@ package sh.libre.scim.storage;
 
 import java.util.Date;
 import java.util.List;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 import jakarta.ws.rs.core.MediaType;
 
 import org.jboss.logging.Logger;
 import org.keycloak.component.ComponentModel;
+import org.keycloak.component.ComponentValidationException;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.KeycloakSessionTask;
+import org.keycloak.models.RealmModel;
 import org.keycloak.models.utils.KeycloakModelUtils;
 import org.keycloak.provider.ProviderConfigProperty;
 import org.keycloak.provider.ProviderConfigurationBuilder;
@@ -69,6 +73,18 @@ public class ScimStorageProviderFactory
                 .helpText("Password or token required for basic or bearer authentification.")
                 .add()
                 .property()
+                .name("user-name-source")
+                .type(ProviderConfigProperty.LIST_TYPE)
+                .label("SCIM userName source")
+                .helpText("""
+                        Keycloak field sent as the SCIM userName. \
+                        Use email when the remote matches the SAML NameID (email) against the userName. \
+                        Users without a value for this field are not pushed.\
+                        """)
+                .options(UserAdapter.USER_NAME_SOURCE_USERNAME, UserAdapter.USER_NAME_SOURCE_EMAIL)
+                .defaultValue(UserAdapter.USER_NAME_SOURCE_USERNAME)
+                .add()
+                .property()
                 .name("propagation-user")
                 .type(ProviderConfigProperty.BOOLEAN_TYPE)
                 .label("Enable user propagation")
@@ -112,6 +128,18 @@ public class ScimStorageProviderFactory
                 .helpText("Only used when endpoint doesn't support putUser API operation (full replace)")
                 .defaultValue(false)
                 .add()
+                .property()
+                .name("group-filter")
+                .type(ProviderConfigProperty.STRING_TYPE)
+                .label("Group path filter (regex)")
+                .helpText("""
+                        Java regex matched against the full group path (e.g. /aws/dev). \
+                        A group is pushed only if its path matches; a user is in scope only if \
+                        directly member of at least one matching group. \
+                        Required. Use .* to push every group and every user that belongs to a group.\
+                        """)
+                .required(true)
+                .add()
                 .build();
     }
 
@@ -119,6 +147,20 @@ public class ScimStorageProviderFactory
     public ScimStorageProvider create(KeycloakSession session, ComponentModel model) {
         LOGGER.info("create");
         return new ScimStorageProvider();
+    }
+
+    @Override
+    public void validateConfiguration(KeycloakSession session, RealmModel realm, ComponentModel config)
+            throws ComponentValidationException {
+        var regex = config.get("group-filter");
+        if (regex == null || regex.isBlank()) {
+            throw new ComponentValidationException("Group path filter is required (use .* to match every group)");
+        }
+        try {
+            Pattern.compile(regex);
+        } catch (PatternSyntaxException e) {
+            throw new ComponentValidationException("Invalid group path filter regex: " + e.getMessage(), e);
+        }
     }
 
     @Override
@@ -135,7 +177,10 @@ public class ScimStorageProviderFactory
     public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId,
             UserStorageProviderModel model) {
         LOGGER.info("sync");
+        // The admin console shows this result as "users", so it only counts users.
+        // Group counts are logged separately.
         var result = new SynchronizationResult();
+        var groupResult = new SynchronizationResult();
         KeycloakModelUtils.runJobInTransaction(sessionFactory, new KeycloakSessionTask() {
 
             @Override
@@ -147,7 +192,10 @@ public class ScimStorageProviderFactory
                     dispatcher.runOne(model, client -> client.sync(UserAdapter.class, result));
                 }
                 if ("true".equals(model.get("propagation-group"))) {
-                    dispatcher.runOne(model, client -> client.sync(GroupAdapter.class, result));
+                    dispatcher.runOne(model, client -> client.sync(GroupAdapter.class, groupResult));
+                    LOGGER.infof("group sync: %d added, %d updated, %d removed, %d failed",
+                            groupResult.getAdded(), groupResult.getUpdated(),
+                            groupResult.getRemoved(), groupResult.getFailed());
                 }
             }
 

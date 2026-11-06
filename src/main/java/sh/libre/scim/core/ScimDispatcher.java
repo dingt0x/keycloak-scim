@@ -33,7 +33,7 @@ public class ScimDispatcher {
         try {
             f.accept(client);
         } catch (Exception e) {
-            LOGGER.error(e);
+            LOGGER.error(e.getMessage(), e);
         } finally {
             client.close();
         }

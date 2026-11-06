@@ -25,7 +25,14 @@ import org.keycloak.models.UserModel;
 
 public class UserAdapter extends Adapter<UserModel, User> {
 
+    public static final String USER_NAME_SOURCE_USERNAME = "username";
+    public static final String USER_NAME_SOURCE_EMAIL = "email";
+
+    /** Keycloak username, used for local logic (matching, admin skip, local creation). */
     private String username;
+    /** Value sent as SCIM userName: the Keycloak username or email, per the user-name-source setting. */
+    private String scimUserName;
+    private final String userNameSource;
     private String displayName;
     private String givenName;
     private String familyName;
@@ -35,6 +42,9 @@ public class UserAdapter extends Adapter<UserModel, User> {
 
     public UserAdapter(KeycloakSession session, String componentId) {
         super(session, componentId, "User", Logger.getLogger(UserAdapter.class));
+        var component = realm.getComponent(componentId);
+        this.userNameSource = component == null ? USER_NAME_SOURCE_USERNAME
+                : component.get("user-name-source", USER_NAME_SOURCE_USERNAME);
     }
 
     public String getUsername() {
@@ -93,6 +103,11 @@ public class UserAdapter extends Adapter<UserModel, User> {
         }
     }
 
+    /** Unconditionally overrides the active flag (setActive only assigns when null). */
+    public void overrideActive(Boolean active) {
+        this.active = active;
+    }
+
     public String[] getRoles() {
         return roles;
     }
@@ -137,16 +152,21 @@ public class UserAdapter extends Adapter<UserModel, User> {
         rolesSet.toArray(roles);
         setRoles(roles);
         this.skip = StringUtils.equals(user.getFirstAttribute("scim-skip"), "true");
+        this.scimUserName = USER_NAME_SOURCE_EMAIL.equals(userNameSource) ? user.getEmail() : user.getUsername();
+        if (StringUtils.isBlank(scimUserName)) {
+            LOGGER.warnf("user %s has no %s, it can't be pushed as SCIM userName", user.getUsername(), userNameSource);
+            this.skip = true;
+        }
     }
 
     @Override
     public void apply(User user) {
-        setExternalId(user.getId().get());
-        setUsername(user.getUserName().get());
-        setDisplayName(user.getDisplayName().get());
-        setActive(user.isActive().get());
+        setExternalId(user.getId().orElse(null));
+        setUsername(user.getUserName().orElse(null));
+        setDisplayName(user.getDisplayName().orElse(null));
+        setActive(user.isActive().orElse(null));
         if (user.getEmails().size() > 0) {
-            setEmail(user.getEmails().get(0).getValue().get());
+            setEmail(user.getEmails().get(0).getValue().orElse(null));
         }
     }
 
@@ -154,7 +174,7 @@ public class UserAdapter extends Adapter<UserModel, User> {
     public User toSCIM(Boolean addMeta) {
         var user = new User();
         user.setExternalId(id);
-        user.setUserName(username);
+        user.setUserName(scimUserName);
         user.setId(externalId);
         user.setDisplayName(displayName);
         Name name = new Name();
@@ -178,10 +198,12 @@ public class UserAdapter extends Adapter<UserModel, User> {
             user.setMeta(meta);
         }
         List<PersonRole> roles = new ArrayList<PersonRole>();
-        for (var r : this.roles) {
-            var role = new PersonRole();
-            role.setValue(r);
-            roles.add(role);
+        if (this.roles != null) {
+            for (var r : this.roles) {
+                var role = new PersonRole();
+                role.setValue(r);
+                roles.add(role);
+            }
         }
         user.setRoles(roles);
         return user;
@@ -221,7 +243,7 @@ public class UserAdapter extends Adapter<UserModel, User> {
             sameEmailUser = session.users().getUserByEmail(realm, email);
         }
         if ((sameUsernameUser != null && sameEmailUser != null)
-                && (sameUsernameUser.getId() != sameEmailUser.getId())) {
+                && (!StringUtils.equals(sameUsernameUser.getId(), sameEmailUser.getId()))) {
             LOGGER.warnf("found 2 possible users for remote user %s %s", username, email);
             return false;
         }
@@ -257,11 +279,11 @@ public class UserAdapter extends Adapter<UserModel, User> {
         patchBuilder.addOperation()
                       .path("active")
                       .op(PatchOp.REPLACE)
-                      .value(active.toString())
+                      .value(String.valueOf(Boolean.TRUE.equals(active)))
                       .next()
                       .path("userName")
                       .op(PatchOp.REPLACE)
-                      .value(username)
+                      .value(scimUserName)
                       .next()
                       .path("displayName")
                       .op(PatchOp.REPLACE)

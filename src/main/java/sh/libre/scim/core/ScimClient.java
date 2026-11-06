@@ -2,6 +2,7 @@ package sh.libre.scim.core;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.NoResultException;
@@ -18,7 +19,9 @@ import de.captaingoldfish.scim.sdk.common.response.ListResponse;
 import org.jboss.logging.Logger;
 import org.keycloak.component.ComponentModel;
 import org.keycloak.connections.jpa.JpaConnectionProvider;
+import org.keycloak.models.GroupModel;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.UserModel;
 import org.keycloak.models.RoleMapperModel;
 import org.keycloak.storage.user.SynchronizationResult;
 
@@ -39,9 +42,11 @@ public class ScimClient {
     final protected String scimApplicationBaseUrl;
     final protected Map<String, String> defaultHeaders;
     final protected Map<String, String> expectedResponseHeaders;
+    final protected GroupFilter groupFilter;
 
     public ScimClient(ComponentModel model, KeycloakSession session) {
         this.model = model;
+        this.groupFilter = new GroupFilter(model.get("group-filter"));
         this.contentType = model.get("content-type");
         this.session = session;
         this.scimApplicationBaseUrl = model.get("endpoint");
@@ -75,8 +80,8 @@ public class ScimClient {
 
     protected String BasicAuthentication(String username, String password) {
         return  BasicAuth.builder()
-        .username(model.get(username))
-        .password(model.get(password))
+        .username(username)
+        .password(password)
         .build()
         .getAuthorizationHeaderValue();
     }
@@ -88,7 +93,6 @@ public class ScimClient {
         .requestTimeout(5)
         .socketTimeout(5)
         .expectedHttpResponseHeaders(expectedResponseHeaders)
-        .hostnameVerifier((s, sslSession) -> true)
         .build();
     }
 
@@ -121,23 +125,37 @@ public class ScimClient {
         }
     }
 
-    public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void create(Class<A> aClass,
+    protected boolean inScope(RoleMapperModel kcModel) {
+        if (kcModel instanceof UserModel) {
+            return groupFilter.inScope((UserModel) kcModel);
+        }
+        if (kcModel instanceof GroupModel) {
+            return groupFilter.inScope((GroupModel) kcModel);
+        }
+        return true;
+    }
+
+    /** @return TRUE if created on the remote, FALSE if the remote request failed, null if nothing was done. */
+    public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> Boolean create(Class<A> aClass,
             M kcModel) {
+        if (groupFilter.isInvalid() || !inScope(kcModel)) {
+            return null;
+        }
         var adapter = getAdapter(aClass);
         adapter.apply(kcModel);
         if (adapter.skip) {
-            return;
+            return null;
         }
         // If mapping exist then it was created by import so skip.
         if (adapter.query("findById", adapter.getId()).getResultList().size() != 0) {
-            return;
+            return null;
         }
         var retry = registry.retry("create-" + adapter.getId());
 
         ServerResponse<S> response = retry.executeSupplier(() -> {
             try {
                 return scimRequestBuilder
-                .create(adapter.getResourceClass(), ("/" + adapter.getSCIMEndpoint()).formatted())
+                .create(adapter.getResourceClass(), "/" + adapter.getSCIMEndpoint())
                 .setResource(adapter.toSCIM(false))
                 .sendRequest();
             } catch (ResponseException e) {
@@ -148,14 +166,19 @@ public class ScimClient {
         if (!response.isSuccess()){
             LOGGER.warn(response.getResponseBody());
             LOGGER.warn(response.getHttpStatus());
+            return false;
         }
 
         adapter.apply(response.getResource());
         adapter.saveMapping();
-    };
+        return true;
+    }
 
     public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void replace(Class<A> aClass,
             M kcModel) {
+        if (groupFilter.isInvalid()) {
+            return;
+        }
         var adapter = getAdapter(aClass);
         try {
             adapter.apply(kcModel);
@@ -164,13 +187,21 @@ public class ScimClient {
             }
             var resource = adapter.query("findById", adapter.getId()).getSingleResult();
             adapter.apply(resource);
+            boolean inScope = inScope(kcModel);
+            if (adapter instanceof GroupAdapter && !inScope) {
+                // Group no longer matches (renamed/moved): remove it from the remote.
+                delete(aClass, adapter.getId());
+                return;
+            }
+            if (adapter instanceof UserAdapter) {
+                ((UserAdapter) adapter).overrideActive(((UserModel) kcModel).isEnabled() && inScope);
+            }
             String url = genScimUrl(adapter.getSCIMEndpoint(), adapter.getExternalId());
             var retry = registry.retry("replace-" + adapter.getId());
             ServerResponse<S> response = retry.executeSupplier(() -> {
                 try {
-                    LOGGER.info(adapter.getType());
-                    if ((adapter.getType() == "Group" && this.model.get("group-patchOp", false))
-                         || (adapter.getType() == "User" && this.model.get("user-patchOp", false))) {
+                    if (("Group".equals(adapter.getType()) && this.model.get("group-patchOp", false))
+                         || ("User".equals(adapter.getType()) && this.model.get("user-patchOp", false))) {
                         return adapter.toPatchBuilder(scimRequestBuilder, url)
                                       .sendRequest();
                     }
@@ -189,9 +220,13 @@ public class ScimClient {
                 LOGGER.warn(response.getHttpStatus());
             }
         } catch (NoResultException e) {
-            LOGGER.warnf("failed to replace resource %s, scim mapping not found", adapter.getId());
+            // No remote copy yet. In scope: create it (user entering the scope, or a new subgroup
+            // reported as a replace). Out of scope: nothing to do.
+            if (inScope(kcModel)) {
+                create(aClass, kcModel);
+            }
         } catch (Exception e) {
-            LOGGER.error(e);
+            LOGGER.error(e.getMessage(), e);
         }
     }
 
@@ -216,9 +251,10 @@ public class ScimClient {
                 }
             });
 
-            if (!response.isSuccess()){
+            if (!response.isSuccess() && response.getHttpStatus() != 404) {
                 LOGGER.warn(response.getResponseBody());
                 LOGGER.warn(response.getHttpStatus());
+                return;
             }
 
             getEM().remove(resource);
@@ -239,13 +275,22 @@ public class ScimClient {
             if (!adapter.skipRefresh()) {
                 var mapping = adapter.getMapping();
                 if (mapping == null) {
+                    if (groupFilter.isInvalid() || !inScope(resource)) {
+                        // Not on the remote and not in scope: nothing to push.
+                        return;
+                    }
                     LOGGER.info("Creating it");
-                    this.create(aClass, resource);
+                    var created = this.create(aClass, resource);
+                    if (Boolean.TRUE.equals(created)) {
+                        syncRes.increaseAdded();
+                    } else if (Boolean.FALSE.equals(created)) {
+                        syncRes.increaseFailed();
+                    }
                 } else {
                     LOGGER.info("Replacing it");
                     this.replace(aClass, resource);
+                    syncRes.increaseUpdated();
                 }
-                syncRes.increaseUpdated();
             }
         });
 
@@ -256,7 +301,13 @@ public class ScimClient {
         LOGGER.info("Import");
         try {
             var adapter = getAdapter(aClass);
-            ServerResponse<ListResponse<S>> response  = scimRequestBuilder.list("url", adapter.getResourceClass()).get().sendRequest();
+            ServerResponse<ListResponse<S>> response  = scimRequestBuilder.list(adapter.getResourceClass(), "/" + adapter.getSCIMEndpoint()).get().sendRequest();
+            if (!response.isSuccess()) {
+                LOGGER.warnf("failed to list remote resources, status: %s, body: %s",
+                             response.getHttpStatus(), response.getResponseBody());
+                syncRes.increaseFailed();
+                return;
+            }
             ListResponse<S> resourceTypeListResponse = response.getResource();
 
             for (var resource : resourceTypeListResponse.getListedResources()) {
@@ -282,7 +333,7 @@ public class ScimClient {
                         LOGGER.info("Matched");
                         adapter.saveMapping();
                     } else {
-                        switch (this.model.get("sync-import-action")) {
+                        switch (Objects.requireNonNullElse(this.model.get("sync-import-action"), "NOTHING")) {
                             case "CREATE_LOCAL":
                                 LOGGER.info("Create local resource");
                                 try {
@@ -290,23 +341,33 @@ public class ScimClient {
                                     adapter.saveMapping();
                                     syncRes.increaseAdded();
                                 } catch (Exception e) {
-                                    LOGGER.error(e);
+                                    LOGGER.error(e.getMessage(), e);
                                 }
                                 break;
                             case "DELETE_REMOTE":
                                 LOGGER.info("Delete remote resource");
-                                scimRequestBuilder
+                                if (adapter.getExternalId() == null) {
+                                    LOGGER.warn("remote resource has no id, can't delete it");
+                                    syncRes.increaseFailed();
+                                    break;
+                                }
+                                ServerResponse<S> deleteResponse = scimRequestBuilder
                                     .delete(genScimUrl(adapter.getSCIMEndpoint(),
-                                                       resource.getId().get()),
+                                                       adapter.getExternalId()),
                                                        adapter.getResourceClass())
                                     .sendRequest();
-                                syncRes.increaseRemoved();
+                                if (deleteResponse.isSuccess()) {
+                                    syncRes.increaseRemoved();
+                                } else {
+                                    LOGGER.warnf("failed to delete remote resource %s, status: %s, body: %s",
+                                                 adapter.getExternalId(), deleteResponse.getHttpStatus(),
+                                                 deleteResponse.getResponseBody());
+                                }
                                 break;
                         }
                     }
                 } catch (Exception e) {
-                    LOGGER.error(e);
-                    e.printStackTrace();
+                    LOGGER.error(e.getMessage(), e);
                     syncRes.increaseFailed();
                 }
             }
@@ -318,7 +379,13 @@ public class ScimClient {
     public <M extends RoleMapperModel, S extends ResourceNode, A extends Adapter<M, S>> void sync(Class<A> aClass,
             SynchronizationResult syncRes) {
         if (this.model.get("sync-import", false)) {
-            this.importResources(aClass, syncRes);
+            try {
+                this.importResources(aClass, syncRes);
+            } catch (Exception e) {
+                // A failed import must not prevent the refresh below.
+                LOGGER.error("import failed", e);
+                syncRes.increaseFailed();
+            }
         }
         if (this.model.get("sync-refresh", false)) {
             this.refreshResources(aClass, syncRes);

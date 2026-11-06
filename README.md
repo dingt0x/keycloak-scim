@@ -27,9 +27,21 @@ Because the event listener is the source of the SCIM flow, and it is not cancela
 
 ## Usage
 
+### Compatibility
+
+Keycloak 26 (built and tested against 26.8.1).
+
+### Build
+
+```sh
+./gradlew shadowJar
+```
+
+The provider jar is written to `build/libs/keycloak-scim.jar`. Libraries that Keycloak already ships (BouncyCastle, Apache HttpClient, Jackson, commons-io, commons-lang3, SLF4J, Jakarta APIs) are not bundled.
+
 ### Installation (quick)
 
-1. Download the [latest version](https://lab.libreho.st/libre.sh/scim/keycloak-scim/-/jobs/artifacts/main/raw/build/libs/keycloak-scim-1.0-SNAPSHOT-all.jar?job=package)
+1. Download `keycloak-scim.jar` from the GitHub Releases of this repository, or build it.
 2. Put it in `/opt/keycloak/providers/`.
 
 It's also possible to build your own custom image if you run Keycloak in a [container](/docs/container.md).
@@ -71,6 +83,29 @@ If you enable import during sync then you can choose between to following import
 
 
 
+
+### Group path filter
+
+The `group-filter` setting restricts what is pushed to a SCIM endpoint. It is a Java regex that is searched (`find`) in the **full path** of a group, e.g. `/aws/dev`.
+
+- A group is pushed only if its path matches.
+- A user is in scope only if they are a **direct** member of at least one matching group (parent groups are not considered).
+- Examples:
+  - `^/aws(/.*)?$` : `/aws` and everything below it.
+  - `^/aws/.*` : only the sub-groups of `/aws`, not `/aws` itself.
+  - `^/aws$` : only `/aws` itself, not its sub-groups.
+- When a user leaves the scope, the remote account is kept but updated with `active=false`. When a group no longer matches (renamed, moved), it is deleted from the remote.
+- The setting is **required**: an empty value is rejected on save. Use `.*` to push every group and every user that belongs to at least one group. Users without any group are never pushed.
+- An invalid regex is rejected on save; if an existing one is invalid at runtime, nothing is pushed to that endpoint.
+
+### SCIM userName source
+
+The `user-name-source` setting chooses which Keycloak field is sent as the SCIM `userName`:
+
+- `username` (default): the Keycloak username.
+- `email`: the user's email. Use it when the remote matches the SAML NameID (configured as email) against the `userName`, e.g. Alibaba Cloud CloudSSO.
+
+Users without a value for the chosen field are not pushed. Changing the setting updates the `userName` of already pushed users on their next update or sync; they stay linked through their remote id.
 
 ### Sync
 

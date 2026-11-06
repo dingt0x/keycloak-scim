@@ -58,15 +58,21 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
 
     @Override
     public void apply(Group group) {
-        setExternalId(group.getId().get());
-        setDisplayName(group.getDisplayName().get());
+        setExternalId(group.getId().orElse(null));
+        setDisplayName(group.getDisplayName().orElse(null));
         var groupMembers = group.getMembers();
         if (groupMembers != null && groupMembers.size() > 0) {
             this.members = new HashSet<String>();
             for (var groupMember : groupMembers) {
-                var userMapping = this.query("findByExternalId", groupMember.getValue().get(), "User")
-                        .getSingleResult();
-                this.members.add(userMapping.getId());
+                var externalUserId = groupMember.getValue().orElse(null);
+                try {
+                    var userMapping = this.query("findByExternalId", externalUserId, "User")
+                            .getSingleResult();
+                    this.members.add(userMapping.getId());
+                } catch (NoResultException e) {
+                    LOGGER.warnf("skipping member %s of group %s, scim mapping not found",
+                            externalUserId, displayName);
+                }
             }
         }
     }
@@ -88,7 +94,7 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                     groupMember.setRef(ref.toString());
                     groupMembers.add(groupMember);
                 } catch (Exception e) {
-                    LOGGER.error(e);
+                    LOGGER.error(e.getMessage(), e);
                 }
             }
             group.setMembers(groupMembers);
@@ -119,7 +125,7 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
 
     @Override
     public Boolean tryToMap() {
-        var group = session.groups().getGroupsStream(realm).filter(x -> x.getName() == displayName).findFirst();
+        var group = session.groups().getGroupsStream(realm).filter(x -> StringUtils.equals(x.getName(), displayName)).findFirst();
         if (group.isPresent()) {
             setId(group.get().getId());
             return true;
@@ -139,7 +145,7 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
                 }
                 user.joinGroup(group);
             } catch (Exception e) {
-                LOGGER.warn(e);
+                LOGGER.warn(e.getMessage(), e);
             }
         }
     }
@@ -159,11 +165,15 @@ public class GroupAdapter extends Adapter<GroupModel, Group> {
         List<Member> groupMembers = new ArrayList<>();
         PatchBuilder<Group> patchBuilder;
         patchBuilder = scimRequestBuilder.patch(url, Group.class);
-        if (members.size() > 0) {
-            for (String member : members) {
+        for (String member : members) {
+            try {
                 var userMapping = this.query("findById", member, "User").getSingleResult();
                 groupMembers.add(Member.builder().value(userMapping.getExternalId()).build());
+            } catch (NoResultException e) {
+                LOGGER.warnf("skipping member %s of group %s, scim mapping not found", member, displayName);
             }
+        }
+        if (groupMembers.size() > 0) {
             patchBuilder.addOperation()
                 .path("members")
                 .op(PatchOp.REPLACE)

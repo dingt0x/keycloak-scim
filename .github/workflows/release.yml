@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v26.8.1-1.0.0)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then TAG="$INPUT_TAG"; else TAG="$REF_NAME"; fi
+          # Validate the format to prevent injection.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9A-Za-z.-]+$'; then
+            echo "Invalid tag '$TAG': must start with 'v' and contain only letters, digits, '.' and '-'"
+            exit 1
+          fi
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+
+      - name: Check tag matches the project version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          VERSION=$(./gradlew --no-daemon -q properties | sed -n 's/^version: //p')
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "Tag $TAG does not match project version $VERSION (expected v$VERSION)"
+            exit 1
+          fi
+
+      - name: Build
+        run: ./gradlew --no-daemon shadowJar
+
+      - name: Upload jar
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: keycloak-scim
+          path: build/libs/keycloak-scim.jar
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download jar
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: keycloak-scim
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@28ab305d0ffa26d60ec4bd614126329e26c7a0ec # v3.0.4
+        with:
+          files: keycloak-scim.jar
+          generate_release_notes: true
+          name: Release ${{ needs.build.outputs.tag }}
+          tag_name: ${{ needs.build.outputs.tag }}
+          draft: false
+          prerelease: false

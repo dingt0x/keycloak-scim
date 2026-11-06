@@ -5,10 +5,21 @@ plugins {
 }
 
 group = 'sh.libre.scim'
-version = '1.0-SNAPSHOT'
 description = 'keycloak-scim'
 
+// Version is {Keycloak version}-{plugin version}: the Keycloak version the build is
+// tested against, then the plugin's own version. Release tags are "v" + version.
+ext {
+    keycloakVersion = '26.8.1'
+    pluginVersion = '1.0.0'
+}
+version = "${keycloakVersion}-${pluginVersion}"
+
 java.sourceCompatibility = JavaVersion.VERSION_17
+
+shadowJar {
+    archiveFileName = 'keycloak-scim.jar'
+}
 
 rewrite {
     activeRecipe(
@@ -25,18 +36,34 @@ repositories {
 dependencies {
     rewrite(platform("org.openrewrite.recipe:rewrite-recipe-bom:2.20.0"))
     rewrite("org.openrewrite.recipe:rewrite-migrate-java")
+
+    // Provided by the Keycloak server at runtime, never bundled.
+    compileOnly "org.keycloak:keycloak-core:${keycloakVersion}"
+    compileOnly "org.keycloak:keycloak-server-spi:${keycloakVersion}"
+    compileOnly "org.keycloak:keycloak-server-spi-private:${keycloakVersion}"
+    compileOnly "org.keycloak:keycloak-services:${keycloakVersion}"
+    compileOnly "org.keycloak:keycloak-model-jpa:${keycloakVersion}"
+    compileOnly 'jakarta.ws.rs:jakarta.ws.rs-api:3.1.0'
+    compileOnly 'jakarta.persistence:jakarta.persistence-api:3.2.0'
+    compileOnly 'com.google.guava:guava:33.6.0-jre'
+    compileOnly 'org.apache.commons:commons-lang3:3.18.0'
+
+    // Bundled in the shadow jar.
     implementation 'io.github.resilience4j:resilience4j-retry:2.2.0'
-    implementation "jakarta.ws.rs:jakarta.ws.rs-api:4.0.0"
-    implementation "jakarta.persistence:jakarta.persistence-api:3.2.0"
-    compileOnly 'org.keycloak:keycloak-core:25.0.6'
-    compileOnly 'org.keycloak:keycloak-server-spi:25.0.6'
-    compileOnly 'org.keycloak:keycloak-server-spi-private:25.0.6'
-    compileOnly 'org.keycloak:keycloak-services:25.0.6'
-    compileOnly 'org.keycloak:keycloak-model-legacy:24.0.5'
-    compileOnly 'org.keycloak:keycloak-model-legacy-private:23.0.7'
-    compileOnly 'org.keycloak:keycloak-model-jpa:25.0.6'
-    compileOnly 'com.google.guava:guava:31.1-jre'
     implementation 'de.captaingoldfish:scim-sdk-common:1.25.1'
     implementation 'de.captaingoldfish:scim-sdk-client:1.25.1'
-    implementation 'org.apache.commons:commons-lang3:3.18.0'
+}
+
+// Libraries that Keycloak 26 already ships in /opt/keycloak/lib/lib/main.
+// Bundling a second copy can cause class loading conflicts, so the server's copy is used.
+configurations.runtimeClasspath {
+    exclude group: 'org.bouncycastle'
+    exclude group: 'org.apache.httpcomponents'
+    exclude group: 'com.fasterxml.jackson.core'
+    exclude group: 'com.fasterxml.jackson.datatype'
+    exclude group: 'commons-io'
+    exclude group: 'org.apache.commons', module: 'commons-lang3'
+    exclude group: 'org.slf4j'
+    exclude group: 'jakarta.ws.rs'
+    exclude group: 'javax.ws.rs'
 }
